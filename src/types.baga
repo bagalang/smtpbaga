@@ -1,0 +1,126 @@
+// types.baga — типове на smtpbaga: конфигурация, съобщение, резултати.
+// Без I/O — само данни, за да могат тестовете да ги строят без мрежа.
+
+// ---------- грешки ----------
+
+// SMTP грешките са два вида и е важно да се различават:
+//   permanent (5xx) — адресът не съществува, не пращай отново;
+//   transient (4xx) — сървърът е зает, има смисъл да се опита пак.
+// Кодът на сървъра се пази, за да не се губи причината.
+struct SmtpErr {
+    code: i64,     // SMTP код от сървъра (0 = локална грешка преди/след протокола)
+    stage: str,    // connect | ehlo | starttls | tls | auth | mail | rcpt | data | quit
+    msg: str       // четимо съобщение (от сървъра или наше)
+}
+
+fn smtp_err(code: i64, stage: str, msg: str) -> SmtpErr {
+    return SmtpErr { code: code, stage: stage, msg: msg }
+}
+
+// Транзиентна ли е грешката. 4xx и локалните провали (код 0) могат да се
+// опитат пак; 5xx е окончателно.
+fn smtp_err_transient(e: SmtpErr) -> bool {
+    if e.code >= 400 && e.code < 500 {
+        return true
+    }
+    return e.code == 0
+}
+
+// ---------- конфигурация ----------
+
+// Транспортът е изричен, а не "по подразбиране TLS": на порт 465 се
+// говори TLS веднага, на 587 се вдига STARTTLS, на 25 в локална мрежа
+// може и да няма TLS.
+//   0 = plain   — само за dev/mock (напр. MailHog, python -m smtpd)
+//   1 = starttls — свързваш се plain, после STARTTLS (порт 587/25)
+//   2 = tls      — TLS от първия байт, implicit TLS (порт 465)
+fn SMTP_PLAIN() -> i64 { return 0 }
+fn SMTP_STARTTLS() -> i64 { return 1 }
+fn SMTP_TLS() -> i64 { return 2 }
+
+struct SmtpCfg {
+    host: str,
+    port: i64,
+    tls: i64,
+    user: str,
+    pass: str,
+    from: str,
+    timeout_s: i64,
+    // Празни bytes = приемай самоподписан сертификат (dev/mock). За
+    // публичен сървър се подава DER на root CA (виж std/net/tls_conn).
+    anchor_der: bytes,
+    // Име, което се праща в EHLO. Ако е празно, ползва се локалният
+    // hostname — много сървъри го искат да не е "localhost".
+    helo: str
+}
+
+fn smtp_cfg(host: str, port: i64, from: str) -> SmtpCfg {
+    return SmtpCfg {
+        host: host,
+        port: port,
+        tls: SMTP_STARTTLS(),
+        user: "",
+        pass: "",
+        from: from,
+        timeout_s: 20,
+        anchor_der: bytes_from_vec(vec_new()),
+        helo: ""
+    }
+}
+
+// ---------- съобщение ----------
+
+// Един получател: адрес + незадължително показвано име.
+struct SmtpAddr {
+    email: str,
+    name: str,
+    // 1 = CC, 2 = BCC. BCC НЕ се пише в хедърите (само в RCPT), иначе
+    // скритото копие не е скрито.
+    kind: i64
+}
+
+fn smtp_to(email: str) -> SmtpAddr {
+    return SmtpAddr { email: email, name: "", kind: 0 }
+}
+
+fn smtp_cc(email: str) -> SmtpAddr {
+    return SmtpAddr { email: email, name: "", kind: 1 }
+}
+
+fn smtp_bcc(email: str) -> SmtpAddr {
+    return SmtpAddr { email: email, name: "", kind: 2 }
+}
+
+// Писмото. Тялото е само текст: HTML версията се подава отделно и двете
+// стават multipart/alternative — така пощите, които не показват HTML,
+// пак имат четимо писмо (и обратно).
+struct SmtpMsg {
+    subject: str,
+    text: str,
+    html: str,
+    headers: Vec<str>   // допълнителни хедъри, всеки ред "X-Name: value"
+}
+
+fn smtp_msg(subject: str, text: str) -> SmtpMsg {
+    return SmtpMsg { subject: subject, text: text, html: "", headers: vec_new() }
+}
+
+// ---------- резултати ----------
+
+struct SmtpOk {
+    ok: i64,
+    err: SmtpErr,
+    // Последният 250 от сървъра; полезен за лог ("queued as ...").
+    last: str,
+    // Приетите получатели (RCPT 250). Ако сървърът откаже някого,
+    // пращането продължава с осталите — за това е списък, не брояч.
+    accepted: Vec<str>
+}
+
+fn smtp_ok(last: str, accepted: Vec<str>) -> SmtpOk {
+    return SmtpOk { ok: 1, err: smtp_err(0, "", ""), last: last, accepted: accepted }
+}
+
+fn smtp_fail(e: SmtpErr) -> SmtpOk {
+    return SmtpOk { ok: 0, err: e, last: "", accepted: vec_new() }
+}

@@ -1,0 +1,281 @@
+// client.baga — SMTP разговорът: EHLO, STARTTLS, AUTH, MAIL, RCPT, DATA.
+//
+// Редът на стъпките е този от RFC 5321 §4.1.4 и е важен: EHLO първо (за
+// да знаем кои разширения има сървърът), после STARTTLS ако е поискан, и
+// чак тогава AUTH — парола не се праща по plain връзка.
+//
+// Защо без pipelining: може, но печалбата е едно RTT, а шансът да
+// объркаме кой отговор на кой ред отговаря е голям. Изпращаме и чакаме.
+
+import "types.baga"
+import "transport.baga"
+import "message.baga"
+import "std/str/str.baga"
+import "std/bytes/bytes.baga"
+import "std/os/os.baga"
+import "std/time/time.baga"
+
+// ---------- помощни ----------
+
+fn smtp_is_ok(code: i64) -> bool {
+    return code >= 200 && code < 300
+}
+
+// Отказва ли сървърът всички получатели (тогава няма смисъл DATA).
+fn smtp_stage_err(code: i64, stage: str, text: str) -> SmtpErr {
+    return smtp_err(code, stage, concat(concat(stage, ": "), text))
+}
+
+// ---------- EHLO ----------
+
+// Поздравът на сървъра: 220 след отваряне на връзката. Ако не се прочете
+// тук, всеки следващ отговор се размества с един и грешката се появява
+// чак на DATA, където е трудно за откриване.
+struct SmtpGreet {
+    conn: SmtpConn,
+    err: SmtpErr,
+    ok: i64
+}
+
+fn smtp_greeting(sc: SmtpConn) -> SmtpGreet !Net !IO {
+    let r = smtp_reply_read(sc)?
+    if r.reply.ok == 0 {
+        return SmtpGreet { conn: r.conn, err: smtp_err(0, "connect", r.reply.text), ok: 0 }
+    }
+    if r.reply.code != 220 {
+        return SmtpGreet { conn: r.conn, err: smtp_err(r.reply.code, "connect", r.reply.text), ok: 0 }
+    }
+    return SmtpGreet { conn: r.conn, err: smtp_err(0, "", ""), ok: 1 }
+}
+
+// Име, което пращаме в EHLO. Ако cfg.helo е празно, ползваме hostname(1);
+// ако и той е празен — "localhost" (dev/mock сървърите го приемат; реалните
+// често връщат 501 без валидно име).
+fn smtp_helo_name(cfg: SmtpCfg) -> str {
+    if cfg.helo != "" {
+        return cfg.helo
+    }
+    // Няма gethostname() в std — затова валидно име идва само от cfg.
+    // Сървърите, които държат на име, се конфигурират; за dev/mock
+    // "localhost" е достатъчно.
+    return "localhost"
+}
+
+struct SmtpHello {
+    conn: SmtpConn,
+    ehlo: str,       // целият текст на EHLO (за capabilities)
+    has_starttls: i64,
+    has_auth_plain: i64,
+    has_auth_login: i64,
+    err: SmtpErr,
+    ok: i64
+}
+
+fn smtp_hello_fail(sc: SmtpConn, e: SmtpErr) -> SmtpHello {
+    return SmtpHello { conn: sc, ehlo: "", has_starttls: 0, has_auth_plain: 0, has_auth_login: 0, err: e, ok: 0 }
+}
+
+fn smtp_hello(cfg: SmtpCfg, sc: SmtpConn) -> SmtpHello !Net !IO {
+    let mut c = smtp_write_line(sc, concat("EHLO ", smtp_helo_name(cfg)))?
+    let r = smtp_reply_read(c)?
+    c = r.conn
+    if r.reply.ok == 0 {
+        return smtp_hello_fail(c, smtp_err(0, "ehlo", r.reply.text))
+    }
+    if !smtp_is_ok(r.reply.code) {
+        // Някои стари сървъри не знаят EHLO; тогава HELO. Без EHLO обаче
+        // няма STARTTLS/AUTH — тоест става само за plain dev сървър.
+        let h = smtp_write_line(c, concat("HELO ", smtp_helo_name(cfg)))?
+        c = h
+        let r2 = smtp_reply_read(c)?
+        c = r2.conn
+        if r2.reply.ok == 0 || !smtp_is_ok(r2.reply.code) {
+            return smtp_hello_fail(c, smtp_err(r.reply.code, "ehlo", r.reply.text))
+        }
+        return SmtpHello { conn: c, ehlo: r2.reply.text, has_starttls: 0, has_auth_plain: 0, has_auth_login: 0, err: smtp_err(0, "", ""), ok: 1 }
+    }
+    let up = smtp_upper(r.reply.text)
+    let mut st: i64 = 0
+    if str_find(up, "STARTTLS") >= 0 {
+        st = 1
+    }
+    let mut ap: i64 = 0
+    if str_find(up, "AUTH") >= 0 && str_find(up, "PLAIN") >= 0 {
+        ap = 1
+    }
+    let mut al: i64 = 0
+    if str_find(up, "AUTH") >= 0 && str_find(up, "LOGIN") >= 0 {
+        al = 1
+    }
+    return SmtpHello { conn: c, ehlo: r.reply.text, has_starttls: st, has_auth_plain: ap, has_auth_login: al, err: smtp_err(0, "", ""), ok: 1 }
+}
+
+fn smtp_upper(s: str) -> str {
+    let mut out = ""
+    for i in 0..len(s) {
+        let c = char_at(s, i)
+        if c >= 97 && c <= 122 {
+            out = concat(out, chr(c - 32))
+        } else {
+            out = concat(out, chr(c))
+        }
+    }
+    return out
+}
+
+// ---------- STARTTLS ----------
+
+struct SmtpUpgrade {
+    conn: SmtpConn,
+    err: SmtpErr,
+    ok: i64
+}
+
+fn smtp_do_starttls(cfg: SmtpCfg, sc: SmtpConn, has_starttls: i64) -> SmtpUpgrade !Net !IO !Random {
+    if cfg.tls != SMTP_STARTTLS() {
+        return SmtpUpgrade { conn: sc, err: smtp_err(0, "", ""), ok: 1 }
+    }
+    if has_starttls == 0 {
+        // Искали сме криптиране, сървърът не предлага — не пращаме парола
+        // по открита връзка. Това е нарочен отказ, не тихо падане към plain.
+        return SmtpUpgrade { conn: sc, err: smtp_err(0, "starttls", "сървърът не предлага STARTTLS"), ok: 0 }
+    }
+    let mut c = smtp_write_line(sc, "STARTTLS")?
+    let r = smtp_reply_read(c)?
+    c = r.conn
+    if r.reply.ok == 0 || r.reply.code != 220 {
+        return SmtpUpgrade { conn: c, err: smtp_err(r.reply.code, "starttls", r.reply.text), ok: 0 }
+    }
+    let up = smtp_conn_starttls(c, cfg.host, cfg.anchor_der)?
+    if up.ok == 0 {
+        return SmtpUpgrade { conn: up, err: smtp_err(0, "tls", "TLS handshake след STARTTLS се провали"), ok: 0 }
+    }
+    // След STARTTLS EHLO се праща наново (RFC 3207 §4.2) — capabilities
+    // се различават след криптиране.
+    let h = smtp_hello(cfg, up)?
+    if h.ok == 0 {
+        return SmtpUpgrade { conn: h.conn, err: h.err, ok: 0 }
+    }
+    return SmtpUpgrade { conn: h.conn, err: smtp_err(0, "", ""), ok: 1 }
+}
+
+// ---------- AUTH ----------
+
+struct SmtpAuth {
+    conn: SmtpConn,
+    err: SmtpErr,
+    ok: i64
+}
+
+// AUTH LOGIN: потребител и парола, base64, на два отделни реда.
+// Паролата в base64 не е криптиране — затова AUTH се прави само след TLS
+// (виж smtp_do_starttls и проверката по-долу в smtp_send).
+fn smtp_auth(cfg: SmtpCfg, sc: SmtpConn, ehlo: str) -> SmtpAuth !Net !IO {
+    if cfg.user == "" {
+        return SmtpAuth { conn: sc, err: smtp_err(0, "", ""), ok: 1 }
+    }
+    if sc.tls == 0 {
+        return SmtpAuth { conn: sc, err: smtp_err(0, "auth", "AUTH без TLS — отказ (паролата би пътувала в открит вид)"), ok: 0 }
+    }
+    let mut c = smtp_write_line(sc, "AUTH LOGIN")?
+    let r = smtp_reply_read(c)?
+    c = r.conn
+    if r.reply.ok == 0 || r.reply.code != 334 {
+        return SmtpAuth { conn: c, err: smtp_err(r.reply.code, "auth", r.reply.text), ok: 0 }
+    }
+    let u = smtp_write_line(c, base64_encode(vec_from_bytes(bytes_of_str(cfg.user))))?
+    c = u
+    let r2 = smtp_reply_read(c)?
+    c = r2.conn
+    if r2.reply.ok == 0 || r2.reply.code != 334 {
+        return SmtpAuth { conn: c, err: smtp_err(r2.reply.code, "auth", r2.reply.text), ok: 0 }
+    }
+    let p = smtp_write_line(c, base64_encode(vec_from_bytes(bytes_of_str(cfg.pass))))?
+    c = p
+    let r3 = smtp_reply_read(c)?
+    c = r3.conn
+    if r3.reply.ok == 0 || r3.reply.code != 235 {
+        return SmtpAuth { conn: c, err: smtp_err(r3.reply.code, "auth", smtp_reply_last_line(r3.reply.text)), ok: 0 }
+    }
+    return SmtpAuth { conn: c, err: smtp_err(0, "", ""), ok: 1 }
+}
+
+// ---------- RCPT ----------
+
+// Праща RCPT за всеки получател. Отказаните не спират останалите, но ако
+// всички са отказани — това е грешка (DATA би бил 554).
+struct SmtpRcpt {
+    conn: SmtpConn,
+    accepted: Vec<str>,
+    err: SmtpErr,
+    ok: i64
+}
+
+fn smtp_rcpt(cfg: SmtpCfg, sc: SmtpConn, rcpts: Vec<SmtpAddr>) -> SmtpRcpt !Net !IO {
+    let mut c = sc
+    let mut acc: Vec<str> = vec_new()
+    let mut last_code: i64 = 0
+    let mut last_text = ""
+    for i in 0..vec_len(rcpts) {
+        let addr = vec_get(rcpts, i)
+        let w = smtp_write_line(c, concat("RCPT TO:<", concat(addr.email, ">")))?
+        c = w
+        let r = smtp_reply_read(c)?
+        c = r.conn
+        if r.reply.ok == 1 && smtp_is_ok(r.reply.code) {
+            vec_push(acc, addr.email)
+        } else {
+            last_code = r.reply.code
+            last_text = r.reply.text
+        }
+    }
+    if vec_len(acc) == 0 {
+        return SmtpRcpt { conn: c, accepted: acc, err: smtp_stage_err(last_code, "rcpt", last_text), ok: 0 }
+    }
+    return SmtpRcpt { conn: c, accepted: acc, err: smtp_err(0, "", ""), ok: 1 }
+}
+
+// ---------- MAIL FROM / DATA ----------
+
+struct SmtpData {
+    conn: SmtpConn,
+    last: str,
+    err: SmtpErr,
+    ok: i64
+}
+
+fn smtp_mail_from(sc: SmtpConn, from: str) -> SmtpUpgrade !Net !IO {
+    let c = smtp_write_line(sc, concat("MAIL FROM:<", concat(from, ">")))?
+    let r = smtp_reply_read(c)?
+    if r.reply.ok == 0 || !smtp_is_ok(r.reply.code) {
+        return SmtpUpgrade { conn: r.conn, err: smtp_stage_err(r.reply.code, "mail", r.reply.text), ok: 0 }
+    }
+    return SmtpUpgrade { conn: r.conn, err: smtp_err(0, "", ""), ok: 1 }
+}
+
+// Праща DATA: 354, тялото, точка. Тялото вече е с dot-stuffing.
+fn smtp_data_send(sc: SmtpConn, body: str) -> SmtpData !Net !IO {
+    let mut c = smtp_write_line(sc, "DATA")?
+    let r = smtp_reply_read(c)?
+    c = r.conn
+    if r.reply.ok == 0 || r.reply.code != 354 {
+        return SmtpData { conn: c, last: "", err: smtp_stage_err(r.reply.code, "data", r.reply.text), ok: 0 }
+    }
+    let stuffed = smtp_dot_stuff(body)
+    let w = smtp_write(c, concat(stuffed, ".\r\n"))?
+    c = w
+    let done = smtp_reply_read(c)?
+    c = done.conn
+    if done.reply.ok == 0 || !smtp_is_ok(done.reply.code) {
+        return SmtpData { conn: c, last: done.reply.text, err: smtp_stage_err(done.reply.code, "data", done.reply.text), ok: 0 }
+    }
+    return SmtpData { conn: c, last: smtp_reply_last_line(done.reply.text), err: smtp_err(0, "", ""), ok: 1 }
+}
+
+// QUIT — учтиво затваряне. Грешка тук не е провал на пращането: писмото
+// вече е прието (250 след точката).
+fn smtp_quit(sc: SmtpConn) -> SmtpConn !Net !IO {
+    let c = smtp_write_line(sc, "QUIT")?
+    let r = smtp_reply_read(c)?
+    return r.conn
+}

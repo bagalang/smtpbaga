@@ -1,0 +1,287 @@
+// transport.baga — връзка и четене на SMTP отговори. Единственото място,
+// което знае дали говорим plain или TLS: останалият пакет работи с
+// SmtpConn и не се интересува.
+//
+// Защо този файл съществува отделно от client.baga: STARTTLS сменя
+// транспорта по средата на разговора, а това е детайл на сокета, не на
+// протокола. Така клиентът остава четим — той вижда само редове.
+//
+// ВАЖНО за четенето: един TLS запис носи до 16 KB и много често съдържа
+// целия отговор ("220 ...\r\n"). Ако четем побайтово направо от записа,
+// ще изхвърлим остатъка. Затова държим останалите байтове в sc.buf и
+// ги изяждаме един по един. По същата причина НЕ ползваме
+// tls_conn_read_app: тя чете, докато връзката се затвори (писана е за
+// HTTP), а SMTP сървърът чака следващата команда и това би блокирало.
+
+import "types.baga"
+import "std/net/tcp.baga"
+import "std/net/tls_conn.baga"
+import "std/str/str.baga"
+import "std/bytes/bytes.baga"
+
+// Максимум за един ред от сървъра. RFC 5321 §4.5.3.1.5 дава 512 байта за
+// ред; 4096 е щедро и пази от безкраен цикъл при счупен сървър.
+fn smtp_max_line() -> i64 {
+    return 4096
+}
+
+// ---------- връзка ----------
+
+struct SmtpConn {
+    fd: i64,
+    // 0 = plain, 1 = TLS (било то от STARTTLS или implicit).
+    tls: i64,
+    conn: TlsConn,
+    // Непрочетени plaintext байтове от последния TLS запис.
+    buf: bytes,
+    ok: i64
+}
+
+fn smtp_conn_bad(fd: i64) -> SmtpConn {
+    return SmtpConn { fd: fd, tls: 0, conn: tls_conn_bad(""), buf: bytes_of_str(""), ok: 0 }
+}
+
+// Отваря връзка според cfg.tls. При SMTP_TLS TLS-ът се вдига веднага;
+// при SMTP_STARTTLS се свързваме plain и клиентът вика smtp_conn_starttls.
+fn smtp_conn_open(cfg: SmtpCfg) -> SmtpConn !Net !IO !Random {
+    let mut t = cfg.timeout_s
+    if t < 1 {
+        t = 20
+    }
+    if cfg.tls == SMTP_TLS() {
+        // sni: ако е IP, tls_connect сам -празно SNI.
+        let c = tls_connect(cfg.host, cfg.port, t, cfg.anchor_der)?
+        if c.ok == 0 {
+            return smtp_conn_bad(c.fd)
+        }
+        // Таймаут и на ниво сокет, за да не висим при полу-отворена връзка.
+        tcp_set_timeouts(c.fd, t)?
+        return SmtpConn { fd: c.fd, tls: 1, conn: c, buf: bytes_of_str(""), ok: 1 }
+    }
+    let fd = tcp_connect_to(cfg.host, cfg.port, t)?
+    if fd < 0 {
+        return smtp_conn_bad(-1)
+    }
+    tcp_set_timeouts(fd, t)?
+    return SmtpConn { fd: fd, tls: 0, conn: tls_conn_bad(""), buf: bytes_of_str(""), ok: 1 }
+}
+
+// Вдига TLS върху вече отворена plain връзка (STARTTLS, RFC 3207).
+// След успешен отговор 220 целият трафик минава през conn.
+fn smtp_conn_starttls(sc: SmtpConn, host: str, anchor: bytes) -> SmtpConn !Net !IO !Random {
+    if sc.ok == 0 {
+        return sc
+    }
+    let mut sni = host
+    if tls_host_is_ipv4(host) == 1 {
+        sni = ""
+    }
+    let c = tls_handshake(sc.fd, sni, anchor)?
+    if c.ok == 0 {
+        return SmtpConn { fd: sc.fd, tls: 0, conn: c, buf: bytes_of_str(""), ok: 0 }
+    }
+    return SmtpConn { fd: sc.fd, tls: 1, conn: c, buf: bytes_of_str(""), ok: 1 }
+}
+
+fn smtp_conn_close(sc: SmtpConn) -> i64 !Net !IO {
+    if sc.fd < 0 {
+        return 0
+    }
+    // TLS-ът ползва същия fd — затова затваряме веднъж, през него.
+    if sc.tls == 1 {
+        return tls_conn_close(sc.conn)?
+    }
+    return tcp_close(sc.fd)?
+}
+
+// ---------- писане ----------
+
+fn smtp_write(sc: SmtpConn, data: str) -> SmtpConn !Net !IO {
+    if sc.ok == 0 {
+        return sc
+    }
+    if sc.tls == 1 {
+        let c = tls_conn_write(sc.conn, bytes_of_str(data))?
+        if c.ok == 0 {
+            return SmtpConn { fd: sc.fd, tls: sc.tls, conn: c, buf: sc.buf, ok: 0 }
+        }
+        return SmtpConn { fd: sc.fd, tls: sc.tls, conn: c, buf: sc.buf, ok: 1 }
+    }
+    let w = tcp_write(sc.fd, data)?
+    if w < 0 {
+        return SmtpConn { fd: sc.fd, tls: 0, conn: sc.conn, buf: sc.buf, ok: 0 }
+    }
+    return sc
+}
+
+fn smtp_write_line(sc: SmtpConn, line: str) -> SmtpConn !Net !IO {
+    return smtp_write(sc, concat(line, "\r\n"))?
+}
+
+// ---------- четене ----------
+
+struct SmtpReply {
+    code: i64,
+    text: str,
+    ok: i64
+}
+
+struct SmtpRead {
+    conn: SmtpConn,
+    reply: SmtpReply
+}
+
+// Един ред до CRLF (или LF — някои сървъри не слагат CR).
+fn smtp_read_line(sc: SmtpConn) -> SmtpRead !Net !IO {
+    if sc.ok == 0 {
+        return SmtpRead { conn: sc, reply: SmtpReply { code: 0, text: "връзката е затворена", ok: 0 } }
+    }
+    let mut c = sc
+    let mut line = ""
+    let cap = smtp_max_line()
+    let mut running: i64 = 1
+    while running == 1 {
+        let ch = smtp_read_byte(c)?
+        c = ch.conn
+        if ch.ok == 0 {
+            return SmtpRead { conn: c, reply: SmtpReply { code: 0, text: concat("грешка при четене: ", line), ok: 0 } }
+        }
+        if ch.eof == 1 {
+            return SmtpRead { conn: c, reply: SmtpReply { code: 0, text: concat("връзката се затвори: ", line), ok: 0 } }
+        }
+        if ch.b == 10 {
+            running = 0
+        } else {
+            if ch.b != 13 {
+                line = concat(line, ch.ch)
+            }
+            if len(line) > cap {
+                return SmtpRead { conn: c, reply: SmtpReply { code: 0, text: "твърде дълъг ред", ok: 0 } }
+            }
+        }
+    }
+    return SmtpRead { conn: c, reply: SmtpReply { code: 0, text: line, ok: 1 } }
+}
+
+struct SmtpByte {
+    conn: SmtpConn,
+    b: i64,
+    ch: str,
+    eof: i64,
+    ok: i64
+}
+
+// Един байт: първо от буфера (остатък от TLS запис), после нов запис/четене.
+fn smtp_read_byte(sc: SmtpConn) -> SmtpByte !Net !IO {
+    if sc.ok == 0 {
+        return SmtpByte { conn: sc, b: 0, ch: "", eof: 1, ok: 0 }
+    }
+    if bytes_len(sc.buf) > 0 {
+        let b = bytes_at(sc.buf, 0)
+        let rest = bytes_slice(sc.buf, 1, bytes_len(sc.buf))
+        let ch = smtp_byte_str(b)
+        return SmtpByte { conn: smtp_conn_with_buf(sc, rest), b: b, ch: ch, eof: 0, ok: 1 }
+    }
+    if sc.tls == 1 {
+        // Един запис, не до затваряне — виж бележката в началото на файла.
+        let r = tls_conn_read(sc.conn)?
+        let c = smtp_conn_with_tls(sc, r.conn)
+        if bytes_len(r.data) == 0 {
+            // CCS, alert, post-handshake или EOF. За SMTP това значи край.
+            return SmtpByte { conn: c, b: 0, ch: "", eof: 1, ok: 1 }
+        }
+        let b = bytes_at(r.data, 0)
+        let rest = bytes_slice(r.data, 1, bytes_len(r.data))
+        let ch = smtp_byte_str(b)
+        return SmtpByte { conn: smtp_conn_with_buf(c, rest), b: b, ch: ch, eof: 0, ok: 1 }
+    }
+    let s = tcp_read(sc.fd, 1)?
+    if len(s) == 0 {
+        return SmtpByte { conn: sc, b: 0, ch: "", eof: 1, ok: 1 }
+    }
+    return SmtpByte { conn: sc, b: byte_at(s, 0), ch: s, eof: 0, ok: 1 }
+}
+
+// Помощни конструктори: SmtpConn има доста полета и ръчното копиране на
+// всичките във всеки return е покана за забравено поле.
+fn smtp_conn_with_buf(sc: SmtpConn, buf: bytes) -> SmtpConn {
+    return SmtpConn { fd: sc.fd, tls: sc.tls, conn: sc.conn, buf: buf, ok: sc.ok }
+}
+
+fn smtp_conn_with_tls(sc: SmtpConn, conn: TlsConn) -> SmtpConn {
+    return SmtpConn { fd: sc.fd, tls: sc.tls, conn: conn, buf: sc.buf, ok: sc.ok }
+}
+
+// Един байт като едносимволен низ. str_of_bytes е memcpy с дължина, така
+// че NUL байт също минава коректно.
+fn smtp_byte_str(b: i64) -> str {
+    let v: Vec<i64> = vec_new()
+    vec_push(v, b)
+    return str_of_bytes(bytes_from_vec(v))
+}
+
+// Пълен отговор: чете редове, докато разделителят е '-' (multiline,
+// RFC 5321 §4.2.1). Връща кода от последния ред.
+fn smtp_reply_read(sc: SmtpConn) -> SmtpRead !Net !IO {
+    let r = smtp_read_line(sc)?
+    let mut c = r.conn
+    if r.reply.ok == 0 {
+        return SmtpRead { conn: c, reply: r.reply }
+    }
+    let line = r.reply.text
+    let code = smtp_reply_code(line)
+    if code == 0 {
+        return SmtpRead { conn: c, reply: SmtpReply { code: 0, text: concat("неочакван отговор: ", line), ok: 0 } }
+    }
+    let mut all = line
+    // "250-..." означава, че следва още; "250 ..." е краят.
+    let mut more = smtp_reply_more(line)
+    while more == 1 {
+        let n = smtp_read_line(c)?
+        c = n.conn
+        if n.reply.ok == 0 {
+            return SmtpRead { conn: c, reply: n.reply }
+        }
+        all = concat(all, concat("\n", n.reply.text))
+        if smtp_reply_code(n.reply.text) != code {
+            return SmtpRead { conn: c, reply: SmtpReply { code: 0, text: concat("смесен код в отговор: ", all), ok: 0 } }
+        }
+        more = smtp_reply_more(n.reply.text)
+    }
+    return SmtpRead { conn: c, reply: SmtpReply { code: code, text: all, ok: 1 } }
+}
+
+// Първите три знака са кодът (RFC 5321 §4.2).
+fn smtp_reply_code(line: str) -> i64 {
+    if len(line) < 3 {
+        return 0
+    }
+    if !smtp_is_digit(char_at(line, 0)) || !smtp_is_digit(char_at(line, 1)) || !smtp_is_digit(char_at(line, 2)) {
+        return 0
+    }
+    return parse_int(substr(line, 0, 3))
+}
+
+fn smtp_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57
+}
+
+// Четвъртият знак е '-' за продължение, ' ' за край.
+fn smtp_reply_more(line: str) -> i64 {
+    if len(line) < 4 {
+        return 0
+    }
+    if char_at(line, 3) == 45 {
+        return 1
+    }
+    return 0
+}
+
+// Последният ред на отговора (за лог и за 235 authentication ok).
+fn smtp_reply_last_line(text: str) -> str {
+    let lines = str_split(text, "\n")
+    if vec_len(lines) == 0 {
+        return text
+    }
+    return vec_get(lines, vec_len(lines) - 1)
+}

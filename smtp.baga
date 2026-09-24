@@ -1,0 +1,150 @@
+// smtp.baga — smtpbaga: SMTP клиент върху std/net (TCP + TLS 1.3).
+//
+// За какво е: покани, потвърждение на регистрация, reset на парола —
+// нещата, които приложенията пращат по поща. Затова тук има само
+// изпращане; четене на поща (IMAP/POP3) не е нужно и го няма.
+//
+// Защо не разчитаме на външен SMTP релей в кода: конфигурацията е
+// изрична (SmtpCfg), за да може едно и също приложение да говори с
+// локален dev сървър и с реален доставчик без промяна в кода.
+//
+// Типично ползване:
+//
+//   let cfg = smtp_cfg("smtp.example.com", 587, "no-reply@example.com")
+//   cfg.user = "no-reply@example.com"   // AUTH LOGIN
+//   cfg.pass = env("SMTP_PASS")?
+//   let rcpts = vec_new()
+//   vec_push(rcpts, smtp_to("ivan@example.com"))
+//   let msg = smtp_msg("Добре дошли", "Текст на писмото")
+//   let r = smtp_send(cfg, rcpts, msg)?
+//   if r.ok == 0 { eprintln(r.err.msg) }
+
+import "src/types.baga"
+import "src/message.baga"
+import "src/transport.baga"
+import "src/client.baga"
+import "std/str/str.baga"
+import "std/bytes/bytes.baga"
+
+// Праща едно писмо до всички подадени получатели (To/Cc/Bcc).
+//
+// Връща SmtpOk: ok == 1 значи сървърът е приел писмото (250 след
+// точката). Това НЕ значи доставяне — то е отделен етап и за него
+// отговаря сървърът. Затова и not-ok не се хвърля като ефект: викащият
+// решава дали да опита пак (smtp_err_transient).
+fn smtp_send(cfg: SmtpCfg, rcpts: Vec<SmtpAddr>, msg: SmtpMsg) -> SmtpOk !Net !IO !Random !Time {
+    if len(cfg.host) == 0 {
+        return smtp_fail(smtp_err(0, "connect", "не е зададен SMTP хост"))
+    }
+    if len(cfg.from) == 0 {
+        return smtp_fail(smtp_err(0, "mail", "не е зададен подател (cfg.from)"))
+    }
+    if vec_len(rcpts) == 0 {
+        return smtp_fail(smtp_err(0, "rcpt", "няма получатели"))
+    }
+    let sc = smtp_conn_open(cfg)?
+    if sc.ok == 0 {
+        return smtp_fail(smtp_err(0, "connect", concat("не мога да се свържа с ", cfg.host)))
+    }
+    let g = smtp_greeting(sc)?
+    if g.ok == 0 {
+        smtp_conn_close(g.conn)?
+        return smtp_fail(g.err)
+    }
+    let h = smtp_hello(cfg, g.conn)?
+    if h.ok == 0 {
+        smtp_conn_close(h.conn)?
+        return smtp_fail(h.err)
+    }
+    let up = smtp_do_starttls(cfg, h.conn, h.has_starttls)?
+    if up.ok == 0 {
+        smtp_conn_close(up.conn)?
+        return smtp_fail(up.err)
+    }
+    let au = smtp_auth(cfg, up.conn, h.ehlo)?
+    if au.ok == 0 {
+        smtp_conn_close(au.conn)?
+        return smtp_fail(au.err)
+    }
+    let mf = smtp_mail_from(au.conn, cfg.from)?
+    if mf.ok == 0 {
+        smtp_conn_close(mf.conn)?
+        return smtp_fail(mf.err)
+    }
+    let rc = smtp_rcpt(cfg, mf.conn, rcpts)?
+    if rc.ok == 0 {
+        smtp_conn_close(rc.conn)?
+        return smtp_fail(rc.err)
+    }
+    let body = smtp_msg_build_now(msg, smtp_from_addr(cfg), rcpts, smtp_msg_domain(cfg))?
+    let d = smtp_data_send(rc.conn, body)?
+    let after = smtp_quit(d.conn)?
+    smtp_conn_close(after)?
+    if d.ok == 0 {
+        return smtp_fail(d.err)
+    }
+    return smtp_ok(d.last, rc.accepted)
+}
+
+// From хедърът: "Име <адрес>", ако е подадено име в cfg (засега само
+// адресът — името се слага през msg.headers при нужда).
+fn smtp_from_addr(cfg: SmtpCfg) -> str {
+    return cfg.from
+}
+
+// Домейнът за Message-ID: частта след @ на подателя. Ако няма @ —
+// подателят е невалиден и слагаме подразбиращ се.
+fn smtp_msg_domain(cfg: SmtpCfg) -> str {
+    let at = str_find(cfg.from, "@")
+    if at < 0 {
+        return "smtpbaga.local"
+    }
+    let d = substr(cfg.from, at + 1, len(cfg.from))
+    if len(d) == 0 {
+        return "smtpbaga.local"
+    }
+    return d
+}
+
+// Удобна обвивка за най-честия случай: един получател, чисто текстово
+// писмо. За multipart/HTML се ползва smtp_send директно.
+fn smtp_send_text(cfg: SmtpCfg, to: str, subject: str, text: str) -> SmtpOk !Net !IO !Random !Time {
+    let rcpts: Vec<SmtpAddr> = vec_new()
+    vec_push(rcpts, smtp_to(to))
+    return smtp_send(cfg, rcpts, smtp_msg(subject, text))?
+}
+
+// Проверка на конфигурацията без пращане: свързва се, EHLO, STARTTLS,
+// AUTH, QUIT. Полезно при стартиране на приложението, за да се разбере
+// веднага, че паролата/портът не са наред — вместо при първото писмо.
+fn smtp_verify(cfg: SmtpCfg) -> SmtpOk !Net !IO !Random {
+    if len(cfg.host) == 0 {
+        return smtp_fail(smtp_err(0, "connect", "не е зададен SMTP хост"))
+    }
+    let sc = smtp_conn_open(cfg)?
+    if sc.ok == 0 {
+        return smtp_fail(smtp_err(0, "connect", concat("не мога да се свържа с ", cfg.host)))
+    }
+    let g = smtp_greeting(sc)?
+    if g.ok == 0 {
+        smtp_conn_close(g.conn)?
+        return smtp_fail(g.err)
+    }
+    let h = smtp_hello(cfg, g.conn)?
+    if h.ok == 0 {
+        smtp_conn_close(h.conn)?
+        return smtp_fail(h.err)
+    }
+    let up = smtp_do_starttls(cfg, h.conn, h.has_starttls)?
+    if up.ok == 0 {
+        smtp_conn_close(up.conn)?
+        return smtp_fail(up.err)
+    }
+    let au = smtp_auth(cfg, up.conn, h.ehlo)?
+    let c = smtp_quit(au.conn)?
+    smtp_conn_close(c)?
+    if au.ok == 0 {
+        return smtp_fail(au.err)
+    }
+    return smtp_ok("ok", vec_new())
+}

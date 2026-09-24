@@ -1,0 +1,315 @@
+// message.baga — строеж на RFC 5322 съобщение. Чисто: без мрежа, без
+// часовник — датата и Message-ID се подават, за да е тестваемо.
+//
+// Защо всичко е CRLF: RFC 5321 §2.3.8 иска краищата на редовете да са
+// CRLF. Гол LF се приема от повечето сървъри, но не от всички, а
+// разликата се вижда чак при получателя.
+//
+// Защо тялото е base64: писмата са UTF-8, а SMTP исторически е 7-битов.
+// Base64 минава навсякъде без 8BITMIME и без да се чупи на редове с
+// дължина > 998 байта (RFC 5321 §4.5.3.1).
+
+import "types.baga"
+import "std/str/str.baga"
+import "std/bytes/bytes.baga"
+import "std/random/random.baga"
+import "std/time/time.baga"
+import "chronobaga/src/now.baga"
+import "chronobaga/src/types.baga"
+
+fn smtp_crlf() -> str {
+    return "\r\n"
+}
+
+// RFC 5322 дата: "Thu, 24 Sep 2026 14:30:00 +0000".
+// Нашето време е UTC (chronobaga), затова зоната е фиксирана +0000 —
+// без нея някои филтри отхвърлят писмото като подправено.
+fn smtp_date_rfc(d: Date, t: Time) -> str {
+    let daypart = concat(concat(smtp_day_name(d), ", "), smtp_pad2(d.day))
+    let midpart = concat(smtp_month_name(d), concat(" ", int_to_str(d.year)))
+    let timepart = concat(smtp_hms(t), " +0000")
+    return concat(concat(daypart, concat(" ", midpart)), concat(" ", timepart))
+}
+
+fn smtp_pad2(n: i64) -> str {
+    if n < 10 {
+        return concat("0", int_to_str(n))
+    }
+    return int_to_str(n)
+}
+
+fn smtp_hms(t: Time) -> str {
+    return concat(concat(smtp_pad2(t.hour), ":"), concat(concat(smtp_pad2(t.minute), ":"), smtp_pad2(t.second)))
+}
+
+// Денят от седмицата — по ISO броенето, но с имената от RFC 5322.
+// dt_day_of_week не ни трябва: Zeller-подобно смятане тук е по-кратко
+// от още един import и няма как да се обърка с календарни правила,
+// защото датата вече е валидна (идва от chronobaga).
+fn smtp_day_name(d: Date) -> str {
+    // 1970-01-01 беше четвъртък (4 при 0 = неделя).
+    let days = smtp_days_from_civil(d.year, d.month, d.day)
+    let wd = ((days % 7) + 11) % 7   // 0=Неделя
+    if wd == 0 { return "Sun" }
+    if wd == 1 { return "Mon" }
+    if wd == 2 { return "Tue" }
+    if wd == 3 { return "Wed" }
+    if wd == 4 { return "Thu" }
+    if wd == 5 { return "Fri" }
+    return "Sat"
+}
+
+// Дни от 1970-01-01 (Howard Hinnant, civil_from_days обърнато).
+fn smtp_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let mut yy = y
+    if m <= 2 {
+        yy = yy - 1
+    }
+    let era = yy / 400
+    let mut yoe = yy - era * 400
+    if yoe < 0 {
+        yoe = yoe + 400
+    }
+    let mut mp = m - 3
+    if mp < 0 {
+        mp = mp + 12
+    }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+fn smtp_month_name(d: Date) -> str {
+    if d.month == 1 { return "Jan" }
+    if d.month == 2 { return "Feb" }
+    if d.month == 3 { return "Mar" }
+    if d.month == 4 { return "Apr" }
+    if d.month == 5 { return "May" }
+    if d.month == 6 { return "Jun" }
+    if d.month == 7 { return "Jul" }
+    if d.month == 8 { return "Aug" }
+    if d.month == 9 { return "Sep" }
+    if d.month == 10 { return "Oct" }
+    if d.month == 11 { return "Nov" }
+    return "Dec"
+}
+
+// ---------- RFC 2047 заглавни стойности ----------
+
+fn smtp_is_ascii(s: str) -> bool {
+    for i in 0..len(s) {
+        if byte_at(s, i) > 127 {
+            return false
+        }
+    }
+    return true
+}
+
+// Не-ASCII заглавие не може да стои сурово в хедър (RFC 5322 е ASCII).
+// Кодира се като =?UTF-8?B?<base64>?= (RFC 2047).
+fn smtp_hdr_value(s: str) -> str {
+    if smtp_is_ascii(s) {
+        return s
+    }
+    return concat(concat("=?UTF-8?B?", base64_encode(bytes_from_str(s))), "?=")
+}
+
+// ---------- адреси ----------
+
+fn smtp_addr_str(a: SmtpAddr) -> str {
+    if a.name == "" {
+        return a.email
+    }
+    // Кавичките около името са задължителни, ако съдържа запетая или
+    // точка и запетая — иначе адресният списък се разпада. Затова тук
+    // слагаме кавички винаги, когато има име.
+    let q = str_replace(str_replace(a.name, "\\", "\\\\"), "\"", "\\\"")
+    return concat(concat(concat("\"", q), "\" <"), concat(a.email, ">"))
+}
+
+// ---------- MIME ----------
+
+// Base64 на парчета по 76 знака (RFC 2045 §6.8) — иначе някои пощенски
+// сървъри връщат грешка за ред > 998 байта.
+// std/bytes работи с Vec<i64> за байтовете, а builtin-ите — с bytes;
+// vec_from_bytes е мостът между двете.
+fn smtp_b64_str(s: str) -> str {
+    return base64_encode(vec_from_bytes(bytes_of_str(s)))
+}
+
+fn smtp_b64_lines(s: str) -> str {
+    let b = smtp_b64_str(s)
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < len(b) {
+        let mut end = i + 76
+        if end > len(b) {
+            end = len(b)
+        }
+        out = concat(out, substr(b, i, end))
+        out = concat(out, smtp_crlf())
+        i = end
+    }
+    return out
+}
+
+fn smtp_boundary(tag: str) -> str {
+    return concat(concat("=_smtpbaga_", tag), "_=")
+}
+
+// Строи готовото за DATA съобщение (без точката-край; тя е на транспорта).
+fn smtp_msg_build(msg: SmtpMsg, from: str, rcpts: Vec<SmtpAddr>, date_rfc: str, msg_id: str) -> str {
+    let mut h = ""
+    h = concat(h, concat("From: ", from))
+    h = concat(h, smtp_crlf())
+    h = concat(h, concat("To: ", smtp_addr_list(rcpts, 0)))
+    h = concat(h, smtp_crlf())
+    let cc = smtp_addr_list(rcpts, 1)
+    if cc != "" {
+        h = concat(h, concat("Cc: ", cc))
+        h = concat(h, smtp_crlf())
+    }
+    h = concat(h, concat("Subject: ", smtp_hdr_value(msg.subject)))
+    h = concat(h, smtp_crlf())
+    h = concat(h, concat("Date: ", date_rfc))
+    h = concat(h, smtp_crlf())
+    h = concat(h, concat("Message-ID: ", msg_id))
+    h = concat(h, smtp_crlf())
+    h = concat(h, "MIME-Version: 1.0")
+    h = concat(h, smtp_crlf())
+    for i in 0..vec_len(msg.headers) {
+        h = concat(h, vec_get(msg.headers, i))
+        h = concat(h, smtp_crlf())
+    }
+    if len(msg.html) == 0 {
+        // Просто текстово писмо: без multipart, за да не се чупят
+        // стари клиенти.
+        h = concat(h, "Content-Type: text/plain; charset=UTF-8")
+        h = concat(h, smtp_crlf())
+        h = concat(h, "Content-Transfer-Encoding: base64")
+        h = concat(h, smtp_crlf())
+        h = concat(h, smtp_crlf())
+        h = concat(h, smtp_b64_lines(msg.text))
+        return h
+    }
+    let b = smtp_boundary(msg_id_tag(msg_id))
+    h = concat(h, concat("Content-Type: multipart/alternative; boundary=\"", concat(b, "\"")))
+    h = concat(h, smtp_crlf())
+    h = concat(h, smtp_crlf())
+    h = concat(h, smtp_crlf())
+    h = concat(h, concat(concat("--", b), smtp_crlf()))
+    h = concat(h, "Content-Type: text/plain; charset=UTF-8")
+    h = concat(h, smtp_crlf())
+    h = concat(h, "Content-Transfer-Encoding: base64")
+    h = concat(h, smtp_crlf())
+    h = concat(h, smtp_crlf())
+    h = concat(h, smtp_b64_lines(msg.text))
+    h = concat(h, concat(concat("--", b), smtp_crlf()))
+    h = concat(h, "Content-Type: text/html; charset=UTF-8")
+    h = concat(h, smtp_crlf())
+    h = concat(h, "Content-Transfer-Encoding: base64")
+    h = concat(h, smtp_crlf())
+    h = concat(h, smtp_crlf())
+    h = concat(h, smtp_b64_lines(msg.html))
+    h = concat(h, concat(concat("--", b), "--"))
+    h = concat(h, smtp_crlf())
+    return h
+}
+
+// Boundary-то трябва да е уникално в тялото; ползваме част от Message-ID.
+fn msg_id_tag(msg_id: str) -> str {
+    let t = str_replace(str_replace(msg_id, "<", ""), ">", "")
+    let t2 = str_replace(str_replace(t, "@", "_"), ".", "-")
+    if len(t2) == 0 {
+        return "b0"
+    }
+    return t2
+}
+
+// kind: 0 = To, 1 = Cc, 2 = Bcc. BCC умишлено се пропуска — то отива
+// само в RCPT, иначе скритото копие не е скрито.
+fn smtp_addr_list(rcpts: Vec<SmtpAddr>, kind: i64) -> str {
+    let mut out = ""
+    let mut first = true
+    for i in 0..vec_len(rcpts) {
+        let a = vec_get(rcpts, i)
+        if a.kind != kind {
+            continue
+        }
+        if kind == 2 {
+            continue
+        }
+        if !first {
+            out = concat(out, ", ")
+        }
+        out = concat(out, smtp_addr_str(a))
+        first = false
+    }
+    return out
+}
+
+// Получателите, които наистина отиват в RCPT (To + Cc + Bcc).
+fn smtp_rcpt_list(rcpts: Vec<SmtpAddr>) -> Vec<str> {
+    let out: Vec<str> = vec_new()
+    for i in 0..vec_len(rcpts) {
+        vec_push(out, vec_get(rcpts, i).email)
+    }
+    return out
+}
+
+// ---------- DATA dot-stuffing ----------
+
+// RFC 5321 §4.5.2: ред, започващ с точка, се дублира; самотна точка
+// завършва съобщението. Без това тяло с ред ".hidden" би отрязало писмото.
+//
+// Внимание: str_split гледа само първия символ на разделителя, затова
+// тук делим на "\n" и махаме "\r" от края — ако делехме на "\r\n", всеки
+// ред щеше да остане с воден "\n" (виж gaps G-smtp-1).
+fn smtp_dot_stuff(body: str) -> str {
+    let lines = str_split(body, "\n")
+    let mut out = ""
+    for i in 0..vec_len(lines) {
+        let raw = vec_get(lines, i)
+        let ln = smtp_strip_cr(raw)
+        if str_starts_with(ln, ".") {
+            out = concat(out, ".")
+        }
+        out = concat(out, ln)
+        out = concat(out, smtp_crlf())
+    }
+    return out
+}
+
+// Маха един завършващ "\r", ако има такъв.
+fn smtp_strip_cr(s: str) -> str {
+    let n = len(s)
+    if n > 0 && char_at(s, n - 1) == 13 {
+        return substr(s, 0, n - 1)
+    }
+    return s
+}
+
+// Готово Message-ID: уникално и с домейн, за да не го хване спам филтър.
+fn smtp_msg_id_new(domain: str) -> str !Time !Random {
+    let ms = time_now_ms()?
+    let r = random_bytes(6)?
+    let hex = bytes_to_hex(r)
+    let mut d = domain
+    if d == "" {
+        d = "smtpbaga.local"
+    }
+    return concat(concat(concat("<", int_to_str(ms)), concat(".", hex)), concat("@", concat(d, ">")))
+}
+
+// Удобна обвивка: строи съобщение с текущата дата и нов Message-ID.
+fn smtp_msg_build_now(msg: SmtpMsg, from: str, rcpts: Vec<SmtpAddr>, domain: str) -> str !Time !Random {
+    let t = ts_now()?
+    let mut when = DateTime { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0 }
+    if t.ok == 1 {
+        when = t.value
+    }
+    let d = Date { year: when.year, month: when.month, day: when.day }
+    let tm = Time { hour: when.hour, minute: when.minute, second: when.second }
+    let id = smtp_msg_id_new(domain)?
+    return smtp_msg_build(msg, from, rcpts, smtp_date_rfc(d, tm), id)
+}

@@ -1,0 +1,8 @@
+[package]
+name = "smtpbaga"
+version = "0.1.0"
+entry = "smtp.baga"
+
+[dependencies]
+std = { path = "../../std" }
+chronobaga = { path = "../chronobaga" }
