@@ -2,7 +2,9 @@
 //
 // Редът на стъпките е този от RFC 5321 §4.1.4 и е важен: EHLO първо (за
 // да знаем кои разширения има сървърът), после STARTTLS ако е поискан, и
-// чак тогава AUTH — парола не се праща по plain връзка.
+// чак тогава AUTH. Парола по открита връзка минава само при изричен
+// режим plain (порт 80 на Alibaba Direct Mail). Ако е поискан STARTTLS
+// и каналът не се вдигне, AUTH не тръгва.
 //
 // Защо без pipelining: може, но печалбата е едно RTT, а шансът да
 // объркаме кой отговор на кой ред отговаря е голям. Изпращаме и чакаме.
@@ -168,14 +170,16 @@ struct SmtpAuth {
 }
 
 // AUTH LOGIN: потребител и парола, base64, на два отделни реда.
-// Паролата в base64 не е криптиране — затова AUTH се прави само след TLS
-// (виж smtp_do_starttls и проверката по-долу в smtp_send).
+// Base64 не е криптиране. Без TLS AUTH минава само когато режимът е
+// нарочно plain. Иначе паролата не тръгва.
 fn smtp_auth(cfg: SmtpCfg, sc: SmtpConn, ehlo: str) -> SmtpAuth !Net !IO {
     if cfg.user == "" {
         return SmtpAuth { conn: sc, err: smtp_err(0, "", ""), ok: 1 }
     }
     if sc.tls == 0 {
-        return SmtpAuth { conn: sc, err: smtp_err(0, "auth", "AUTH без TLS — отказ (паролата би пътувала в открит вид)"), ok: 0 }
+        if cfg.tls != SMTP_PLAIN() {
+            return SmtpAuth { conn: sc, err: smtp_err(0, "auth", "AUTH без TLS — отказ (паролата би пътувала в открит вид)"), ok: 0 }
+        }
     }
     let mut c = smtp_write_line(sc, "AUTH LOGIN")?
     let r = smtp_reply_read(c)?
