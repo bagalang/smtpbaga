@@ -8,10 +8,10 @@
 
 | # | Дупка | Заобикаляне | Правилно решение |
 |---|-------|-------------|------------------|
-| S1 | `std/str.str_split` дели по **първия символ** на разделителя | делим на `"\n"` и махаме `\r` (`smtp_strip_cr`) | `str_split` да търси целия разделител |
+| S1 | ~~`std/str.str_split` дели по първия символ~~ ✅ затворена — `str_split` търси целия разделител (многосимволен) | `smtp_strip_cr` остава (работи и с новия split; `\r\n` вече може и директно) | ~~`str_split` да търси целия разделител~~ ✅ |
 | S2 | `tls_conn_read_app` чете до затваряне на връзката (HTTP-ориентирана) | буфер в `transport.baga`: един запис + байт по байт | режим „един запис“ в `tls_conn_read` за line-протоколи |
 | S3 | `Vec<i64>` срещу `bytes` — `base64_encode` иска първото, `tls_conn_write` — второто | `vec_from_bytes` / `bytes_of_str` на границата | еднакъв тип байтове в std |
-| S4 | няма `gethostname()` в `std/os` | `cfg.helo` или `"localhost"` | `os_hostname()` в std |
+| S4 | ~~няма `gethostname()` в `std/os`~~ ✅ затворена — `hostname()` в std/os | `cfg.helo` остава по подразбиране (HELO иска FQDN, не machine name) | ~~`os_hostname()` в std~~ ✅ |
 
 ## Съзнателно извън обхвата (v0.1)
 
